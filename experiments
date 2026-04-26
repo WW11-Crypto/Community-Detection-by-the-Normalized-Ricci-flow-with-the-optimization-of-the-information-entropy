@@ -1,0 +1,41 @@
+from networkx.algorithms.community import modularity
+import networkx as nx
+import numpy as np
+
+
+def evaluate_all(G, detected_G):
+    communities = list(nx.connected_components(detected_G))
+    Q = modularity(detected_G, communities)
+    print(f"Modularity Q = {Q:.4f}")
+
+
+
+import networkx as nx
+
+
+def repair_small_communities(G, processed_G, min_comm_size=5):
+    for node in list(nx.isolates(processed_G)):
+        for neighbor in G.neighbors(node):
+            processed_G.add_edge(node, neighbor)
+            break
+    return processed_G
+
+
+
+import networkx as nx
+from src.ricci_flow import run_ricci_flow
+from src.utils import repair_small_communities
+from src.evaluation import evaluate_all
+
+
+def main():
+    G = nx.karate_club_graph()
+
+    processed_G, _, _ = run_ricci_flow(G.copy(), T=10, tau=5, theta=0.1)
+    repaired_G = repair_small_communities(G, processed_G)
+
+    evaluate_all(G, repaired_G)
+
+
+if __name__ == "__main__":
+    main()
