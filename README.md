@@ -1,0 +1,303 @@
+import itertools
+import copy
+import networkx as nx
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import optuna
+from networkx.algorithms.community import modularity
+from scipy.optimize import linprog
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+from tqdm import tqdm  # Import tqdm for the progress bar
+
+# ---- Ricci Flow 核心函数 ----
+def gamma(w):
+    return w
+
+def mu_alpha(G, x, alpha, weights):
+    neighbors = list(G.neighbors(x))
+    weight_sum = sum(gamma(weights[frozenset((x, z))]) for z in neighbors)
+    mu = {x: alpha}
+    for y in neighbors:
+        w = gamma(weights[frozenset((x, y))])
+        mu[y] = (1 - alpha) * w / weight_sum if weight_sum > 0 else 0
+    return mu
+
+def wasserstein_distance(mu1, mu2, support1, support2, dist_func):
+    n, m = len(support1), len(support2)
+    c = [dist_func(a, b) for a in support1 for b in support2]
+    A_eq = []
+    for i in range(n):
+        row = [0] * (n * m)
+        for j in range(m):
+            row[i * m + j] = 1
+        A_eq.append(row)
+    b_eq = [mu1.get(support1[i], 0) for i in range(n)]
+    for j in range(m):
+        row = [0] * (n * m)
+        for i in range(n):
+            row[i * m + j] = 1
+        A_eq.append(row)
+    b_eq += [mu2.get(support2[j], 0) for j in range(m)]
+    bounds = [(0, 1) for _ in range(n * m)]
+    res = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method="highs")
+    return res.fun if res.success else np.inf
+
+def compute_ricci_curvature(G, x, y, weights, all_pairs_shortest_path):
+    alpha = 0.5
+    dist = lambda a, b: all_pairs_shortest_path.get(a, {}).get(b, np.inf)
+    d_xy = dist(x, y)
+    if d_xy == 0:
+        return 0
+    mu_x = mu_alpha(G, x, alpha, weights)
+    mu_y = mu_alpha(G, y, alpha, weights)
+    support_x, support_y = list(mu_x.keys()), list(mu_y.keys())
+    W = wasserstein_distance(mu_x, mu_y, support_x, support_y, dist)
+    return 1 - W / d_xy
+
+def compute_shortest_paths(G):
+    return dict(nx.all_pairs_shortest_path_length(G))
+
+def run_ricci_flow(G, T=10, tau=5, theta=0.1, step_size=0.1, sigma0=1.0):
+    # Step 1: 初始化权重
+    weights = {frozenset((u, v)): sigma0 / G.number_of_edges() for u, v in G.edges()}
+    all_pairs_shortest_path = compute_shortest_paths(G)
+    
+    for t in tqdm(range(1, T + 1), desc="Running Ricci Flow"):
+        # Step 2: 计算 Ricci 曲率
+        curvatures = {frozenset((u, v)): compute_ricci_curvature(G, u, v, weights, all_pairs_shortest_path)
+                      for u, v in G.edges()}
+        
+        # Step 3: 更新权重
+        sigma = sum(weights.values())
+        total_curvature_weight = sum(curv * weights[edge] for edge, curv in curvatures.items())
+        
+        new_weights = {}
+        for edge in G.edges():
+            fe = frozenset(edge)
+            curv = curvatures[fe]
+            update = step_size * (curv + (total_curvature_weight / sigma)) * weights[fe]
+            new_weights[fe] = max(weights[fe] - update, 1e-6)
+        weights = new_weights
+        
+        # Step 4: 周期性边修剪（当 t 可被 tau 整除时）
+        if t % tau == 0:
+            sorted_edges = sorted(weights.items(), key=lambda x: -x[1])
+            num_edges_to_remove = int(len(sorted_edges) * theta)
+            
+            removed_edges = []
+            for e, _ in sorted_edges[:num_edges_to_remove]:
+                u, v = tuple(e)
+                G.remove_edge(u, v)
+                removed_edges.append(e)
+            
+            # 恢复导致孤立节点的边
+            for e in removed_edges:
+                u, v = tuple(e)
+                if G.degree(u) == 0 or G.degree(v) == 0:
+                    G.add_edge(u, v)
+                    weights[e] = 1e-6
+                else:
+                    weights.pop(e, None)
+    
+    return G, curvatures, weights
+
+
+def repair_small_communities(G, processed_G, min_comm_size=5):
+    original_weights = {frozenset((u, v)): 1 for u, v in G.edges()}
+    for node in list(nx.isolates(processed_G)):
+        candidates = [(n, original_weights[frozenset((node, n))]) for n in G.neighbors(node) if n in processed_G.nodes()]
+        if candidates:
+            best_n = min(candidates, key=lambda x: x[1])[0]
+            processed_G.add_edge(node, best_n)
+    max_iterations = 9
+    for _ in tqdm(range(max_iterations), desc="Repairing Small Communities"):
+        communities = list(nx.connected_components(processed_G))
+        small_comms = [c for c in communities if len(c) < min_comm_size]
+        large_comms = [c for c in communities if len(c) >= min_comm_size]
+        if not small_comms or not large_comms:
+            break
+        candidate_edges = []
+        for comm in small_comms:
+            for node in comm:
+                for neighbor in G.neighbors(node):
+                    if neighbor in processed_G.nodes() and not processed_G.has_edge(node, neighbor):
+                        for lc in large_comms:
+                            if neighbor in lc:
+                                w = original_weights.get(frozenset((node, neighbor)), 1.0)
+                                candidate_edges.append((node, neighbor, w))
+                                break
+        if candidate_edges:
+            candidate_edges.sort(key=lambda x: x[2])
+            for u, v, _ in candidate_edges:
+                if processed_G.has_edge(u, v):
+                    continue
+                processed_G.add_edge(u, v)
+                break
+    final_comms = list(nx.connected_components(processed_G))
+    small_comms = [c for c in final_comms if len(c) < min_comm_size]
+    if len(small_comms) >= 2:
+        nodes_to_connect = [node for comm in small_comms for node in comm]
+        if len(nodes_to_connect) >= min_comm_size:
+            center = nodes_to_connect[0]
+            for node in nodes_to_connect[1:]:
+                if not processed_G.has_edge(center, node):
+                    processed_G.add_edge(center, node)
+    return processed_G
+
+
+# ---- 熵计算与优化目标 ----
+def compute_community_entropy(G, community, T=10):
+    t = 0.1 * T  
+    n = len(community)
+    m = sum([1 for u, v in itertools.combinations(community, 2) if G.has_edge(u, v)])
+    A = nx.to_numpy_array(G, nodelist=community)
+    D = np.diag([d for _, d in G.degree(community)])
+    Delta = A - D
+    Delta2 = Delta @ Delta
+    A2 = 0
+    for i in range(n):
+        for j in range(n):
+            if A[i, j] == 1:
+                A2 += 0.5 * Delta2[i, j]
+            else:
+                A2 += Delta2[i, j]
+    A1 = -2 * m
+    B1 = 2 * m
+    entropy = (1 / n) * (A1 * t * np.log(t) + B1 * t + A2 * t**2 * np.log(t))
+    return entropy
+
+def compute_total_entropy(G, T=10):
+    communities = list(nx.connected_components(G))
+    total_entropy = 0
+    for comm in communities:
+        total_entropy += compute_community_entropy(G, comm, T)
+    return total_entropy
+
+
+def evaluate_clustering(G, repaired_G):
+    Q = modularity(repaired_G, list(nx.connected_components(repaired_G)))
+    print(f"模块度 Q = {Q:.4f}")
+
+# ---- 可视化 ----
+def visualize_communities(G, communities, title="", figsize=(14, 12), node_size=300):
+    
+    community_list = list(communities)
+    color_map = cm.get_cmap('tab20b', len(community_list))
+    node_colors = {}
+    for idx, comm in enumerate(community_list):
+        for node in comm:
+            node_colors[node] = color_map(idx)
+
+
+    pos = nx.kamada_kawai_layout(G, weight=None)
+
+    # 绘图准备
+    plt.figure(figsize=figsize)
+    nx.draw_networkx_edges(G, pos, alpha=0.3, edge_color='gray', width=1.0)
+
+    # 分社团绘制节点
+    for idx, comm in enumerate(community_list):
+        nx.draw_networkx_nodes(
+            G, pos,
+            nodelist=list(comm),
+            node_color=[color_map(idx)],
+            node_size=node_size,
+            alpha=0.9,
+            linewidths=0.5,
+            edgecolors='black'
+        )
+
+    # 添加社团图例
+    legend_elements = []
+    for idx, comm in enumerate(community_list):
+        legend_elements.append(
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color_map(idx),
+                       markersize=12, label=f'community{idx+1}')
+        )
+
+    # 图例
+    plt.legend(handles=legend_elements, loc='upper left', fontsize=10, title="community", title_fontsize=12)
+
+    # 标题与美化
+    plt.title(title, fontsize=16, color="#333333", fontweight='bold', pad=15)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
+
+def compute_conductance_on_original_graph(G, communities):
+  
+    # 创建节点到社团的映射
+    node_to_community = {}
+    for i, comm in enumerate(communities):
+        for node in comm:
+            node_to_community[node] = i
+    
+    conductances = []
+    for comm in communities:
+        # 社团内边数（两端都在本社团的边）
+        m_S = sum(1 for u, v in G.edges() 
+                 if node_to_community.get(u, -1) == node_to_community.get(v, -2))
+        
+        # 跨社团边数（一端在本社团，一端在其他社团）
+        c_S = sum(1 for node in comm 
+                 for neighbor in G.neighbors(node)
+                 if node_to_community.get(neighbor, -1) != node_to_community[node])
+        
+        # 计算电导率
+        denominator = m_S + c_S
+        if denominator == 0:
+            conductance = 0.0  # 避免除以零
+        else:
+            conductance = c_S / denominator
+        
+        conductances.append(conductance)
+    
+    avg_conductance = np.mean(conductances) if conductances else 0
+    median_conductance = np.median(conductances) if conductances else 0
+    return avg_conductance, median_conductance, conductances
+
+# ---- 主程序 ----
+def main():
+    
+    df = pd.read_excel()
+    G = nx.from_pandas_edgelist(df, '', '‘, create_using=nx.Graph())
+    def objective(trial):
+        T = trial.suggest_int("T", , )
+        tau = trial.suggest_int("tau", , )
+        theta = trial.suggest_float("theta", ,)
+        G_copy = copy.deepcopy(G)
+        processed_G, _, _ = run_ricci_flow(G_copy, T=T, tau=tau, theta=theta)
+        repaired_G = repair_small_communities(G, processed_G)
+        Q = modularity(repaired_G, list(nx.connected_components(repaired_G)))
+        H = compute_total_entropy(repaired_G, T=T)
+        return Q + H
+    
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=10)
+    best_params = study.best_params
+    print("最佳参数:", best_params)
+    
+    G_copy = copy.deepcopy(G)
+    processed_G, _, _ = run_ricci_flow(G_copy, **best_params)
+    repaired_G = repair_small_communities(G, processed_G)
+    
+    # 获取社团划分结果
+    communities = list(nx.connected_components(repaired_G))
+    print("社团划分结果:", communities)
+    
+    # 在原始图G上计算电导率
+    avg_cond, median_cond, cond_list = compute_conductance_on_original_graph(G, communities)
+    print(f"\n电导率计算结果：")
+    print(f"平均电导率: {avg_cond:.4f}")
+    print(f"中位数电导率: {median_cond:.4f}")
+    print(f"各社团电导率: {[round(c,4) for c in cond_list]}")
+    
+    # 可视化评估
+     visualize_communities(G, communities, title="Final Community Structure", node_size=100)
+    evaluate_clustering(G, repaired_G)
+
+if __name__ == "__main__":
+    main()
